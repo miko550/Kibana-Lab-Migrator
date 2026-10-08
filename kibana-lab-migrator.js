@@ -8,7 +8,6 @@
     window.__klm.panel.style.display = (window.__klm.panel.style.display==='none'?'flex':'none');
     return;
   }
-  var LOADER_TEMPLATE = "#!/usr/bin/env bash\n# GENERATED loader \u2014 recreate an exported dataset on a fresh Elastic 8.x cluster.\n# Creates 5 indices with verified source mappings, bulk-loads the 23 exported\n# *.ndjson.gz files with elasticdump, restores settings, verifies counts,\n# and (optionally) creates Kibana data views with time field \"timestamp\".\n#\n# Requires: bash 4+, curl, jq, gzip, elasticdump (npm i -g elasticdump)\n#\n# Usage:\n#   ./load_hunt_dataset.sh -u https://es:9200 -k <API_KEY> [-d ./exports] [-K https://kibana:5601]\n#   ./load_hunt_dataset.sh -u https://es:9200 -U elastic [-P pass] ...     (prompts if -P omitted)\n#\n# Options:\n#   -u URL     Elasticsearch URL (required)\n#   -k KEY     API key (base64 \"id:key\" encoded form, as returned in \"encoded\")\n#   -U USER    Basic-auth username (alternative to -k)\n#   -P PASS    Basic-auth password (prompted if omitted)\n#   -d DIR     Directory containing the .ndjson.gz files (default: current dir)\n#   -K URL     Kibana URL \u2014 if set, creates data views\n#   -S SPACE   Kibana space for data views (default: default space)\n#   -c FILE    CA certificate for TLS verification\n#   -i         Insecure: skip TLS verification (self-signed lab clusters)\n#   -f         Force: delete and recreate indices that already exist\n#   -r N       Replicas after load (default: 1; use 0 for single-node)\n#   -b N       elasticdump batch size (default: 5000)\n#   -h         Help\nset -euo pipefail\n\nES_URL=\"\" API_KEY=\"\" ES_USER=\"\" ES_PASS=\"\" DATA_DIR=\".\" KB_URL=\"\" KB_SPACE=\"\"\nCA_FILE=\"\" INSECURE=0 FORCE=0 REPLICAS=1 BATCH=5000\n\nusage() { sed -n '2,27p' \"$0\" | sed 's/^# \\{0,1\\}//'; exit \"${1:-0}\"; }\nwhile getopts \"u:k:U:P:d:K:S:c:ifr:b:h\" o; do\n  case $o in\n    u) ES_URL=${OPTARG%/};; k) API_KEY=$OPTARG;; U) ES_USER=$OPTARG;; P) ES_PASS=$OPTARG;;\n    d) DATA_DIR=$OPTARG;; K) KB_URL=${OPTARG%/};; S) KB_SPACE=$OPTARG;; c) CA_FILE=$OPTARG;;\n    i) INSECURE=1;; f) FORCE=1;; r) REPLICAS=$OPTARG;; b) BATCH=$OPTARG;; h) usage 0;; *) usage 1;;\n  esac\ndone\n\nlog()  { printf '[%s] %s\\n' \"$(date +%H:%M:%S)\" \"$*\"; }\ndie()  { printf '[%s] ERROR: %s\\n' \"$(date +%H:%M:%S)\" \"$*\" >&2; exit 1; }\n\n# ---------- preflight ----------\n[[ -n $ES_URL ]] || { echo \"Missing -u\"; usage 1; }\nfor b in curl jq gzip elasticdump; do command -v \"$b\" >/dev/null || die \"'$b' not found in PATH\"; done\n\nif [[ -n $API_KEY ]]; then\n  AUTH=\"ApiKey $API_KEY\"\nelif [[ -n $ES_USER ]]; then\n  [[ -n $ES_PASS ]] || { read -rsp \"Password for $ES_USER: \" ES_PASS; echo; }\n  AUTH=\"Basic $(printf '%s:%s' \"$ES_USER\" \"$ES_PASS\" | base64 | tr -d '\\n')\"\nelse\n  die \"Provide -k API_KEY or -U USER\"\nfi\n\nCURL_TLS=()\nif (( INSECURE )); then CURL_TLS=(-k); export NODE_TLS_REJECT_UNAUTHORIZED=0\nelif [[ -n $CA_FILE ]]; then CURL_TLS=(--cacert \"$CA_FILE\"); export NODE_EXTRA_CA_CERTS=\"$CA_FILE\"; fi\n\n# es METHOD PATH [JSON_BODY] -> sets globals BODY and HTTP_CODE (no subshell)\nTMP=$(mktemp -d); trap 'rm -rf \"$TMP\"' EXIT\nes() {\n  local m=$1 p=$2 b=${3:-}\n  local args=(-sS ${CURL_TLS[@]+\"${CURL_TLS[@]}\"} -X \"$m\" -H \"Authorization: $AUTH\" -H 'Content-Type: application/json' -o \"$TMP/body\" -w '%{http_code}')\n  [[ -n $b ]] && args+=(--data-binary \"$b\")\n  HTTP_CODE=$(curl \"${args[@]}\" \"$ES_URL/$p\") || HTTP_CODE=000\n  BODY=$(cat \"$TMP/body\" 2>/dev/null || true)\n}\n\ndeclare -A EXPECTED=( @@EXPECTED@@ )\ndeclare -A TIMEFIELD=( @@TIMEFIELDS@@ )\nINDICES=( @@INDICES@@ )\n\n@@MAPS@@\n\nlog \"Connecting to $ES_URL\"\nes GET \"\"\n[[ $HTTP_CODE != 000 ]] || die \"Cannot reach $ES_URL\"\n[[ $HTTP_CODE == 200 ]] || die \"Auth/connection failed (HTTP $HTTP_CODE): $BODY\"\nver=$(jq -r '.version.number' <<<\"$BODY\")\nlog \"Elasticsearch $ver\"\n[[ ${ver%%.*} -ge 8 ]] || die \"Elasticsearch 8.x+ required (found $ver)\"\n\n# check data files\nmissing=0\nfor idx in \"${INDICES[@]}\"; do\n  n=$(ls \"$DATA_DIR\"/${idx}.ndjson.gz \"$DATA_DIR\"/${idx}_[0-9]*.ndjson.gz 2>/dev/null | wc -l || true)\n  (( n > 0 )) || { log \"MISSING: no files for $idx in $DATA_DIR\"; missing=1; }\ndone\n(( missing == 0 )) || die \"Data files missing \u2014 check -d\"\n\n# ---------- 1. create indices ----------\nfor idx in \"${INDICES[@]}\"; do\n  es GET \"$idx\"\n  if [[ $HTTP_CODE == 200 ]]; then\n    if (( FORCE )); then log \"$idx exists \u2014 deleting (-f)\"; es DELETE \"$idx\"\n    else die \"$idx already exists on target. Re-run with -f to delete and recreate.\"; fi\n  fi\n  map_var=\"MAP_$idx\"\n  body=$(jq -c --argjson m \"${!map_var}\" -n \\\n    '{settings:{number_of_shards:1,number_of_replicas:0,refresh_interval:\"-1\"},mappings:$m}')\n  es PUT \"$idx\" \"$body\"\n  [[ $HTTP_CODE == 200 ]] || die \"Create $idx failed (HTTP $HTTP_CODE): $BODY\"\n  log \"Created $idx\"\ndone\n\n# ---------- 2. load data ----------\nED_HEADERS=$(jq -cn --arg a \"$AUTH\" '{Authorization:$a}')\n\nfor idx in \"${INDICES[@]}\"; do\n  # match logs_edr_2026-..gz / logs_edr.ndjson.gz but not logs_edr_something_else\n  mapfile -t files < <(ls \"$DATA_DIR\"/${idx}.ndjson.gz \"$DATA_DIR\"/${idx}_[0-9]*.ndjson.gz 2>/dev/null | sort)\n  for f in \"${files[@]}\"; do\n    log \"Loading $(basename \"$f\") -> $idx\"\n    gzip -dc \"$f\" | jq -c '{_source: .}' > \"$TMP/chunk.json\"\n    elasticdump \\\n      --input=\"$TMP/chunk.json\" \\\n      --output=\"$ES_URL/$idx\" \\\n      --type=data \\\n      --headers=\"$ED_HEADERS\" \\\n      --limit=\"$BATCH\" \\\n      --noRefresh \\\n      --retryAttempts=5 --retryDelay=3000 \\\n      > \"$TMP/ed.log\" 2>&1 || { tail -20 \"$TMP/ed.log\"; die \"elasticdump failed on $f\"; }\n    tail -1 \"$TMP/ed.log\"\n  done\ndone\n\n# ---------- 3. restore settings ----------\nfor idx in \"${INDICES[@]}\"; do\n  es PUT \"$idx/_settings\" \"{\\\"index\\\":{\\\"number_of_replicas\\\":$REPLICAS,\\\"refresh_interval\\\":\\\"1s\\\"}}\"\n  [[ $HTTP_CODE == 200 ]] || log \"WARN: settings on $idx HTTP $HTTP_CODE: $BODY\"\n  es POST \"$idx/_refresh\"\ndone\nlog \"Settings restored (replicas=$REPLICAS, refresh=1s)\"\n\n# ---------- 4. verify ----------\nfail=0\nprintf '\\n%-20s %12s %12s  %s\\n' INDEX EXPECTED ACTUAL STATUS\nfor idx in \"${INDICES[@]}\"; do\n  es GET \"$idx/_count\"; c=$(jq -r '.count' <<<\"$BODY\")\n  st=OK; [[ $c == \"${EXPECTED[$idx]}\" ]] || { st=MISMATCH; fail=1; }\n  printf '%-20s %12s %12s  %s\\n' \"$idx\" \"${EXPECTED[$idx]}\" \"$c\" \"$st\"\ndone\necho\n\n# ---------- 5. Kibana data views (optional) ----------\nif [[ -n $KB_URL ]]; then\n  sp=\"\"; [[ -n $KB_SPACE ]] && sp=\"/s/$KB_SPACE\"\n  for idx in \"${INDICES[@]}\"; do\n    tf=${TIMEFIELD[$idx]:--}\n    if [[ -n $tf && $tf != \"-\" ]]; then\n      dv=\"{\\\"data_view\\\":{\\\"title\\\":\\\"$idx\\\",\\\"name\\\":\\\"$idx\\\",\\\"timeFieldName\\\":\\\"$tf\\\"},\\\"override\\\":true}\"\n    else\n      dv=\"{\\\"data_view\\\":{\\\"title\\\":\\\"$idx\\\",\\\"name\\\":\\\"$idx\\\"},\\\"override\\\":true}\"\n    fi\n    code=$(curl -sS ${CURL_TLS[@]+\"${CURL_TLS[@]}\"} -o /dev/null -w '%{http_code}' -X POST \\\n      -H \"Authorization: $AUTH\" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \\\n      \"$KB_URL$sp/api/data_views/data_view\" -d \"$dv\")\n    log \"Data view $idx (time=$tf): HTTP $code\"\n  done\nfi\n\n(( fail == 0 )) && log \"Done \u2014 dataset ready to search.\" || die \"Count mismatch \u2014 see table above.\"\n";
 
   /* ---------- cluster access via the Kibana console proxy ---------- */
   function prefix(){
@@ -23,7 +22,7 @@
     var url = prefix() + '/api/console/proxy?path=' + encodeURIComponent(path) + '&method=' + method;
     for (var a=0;a<4;a++){
       try{
-        var r = await fetch(url, {method:'POST', headers:{'kbn-xsrf':'true','Content-Type':'application/json'},
+        var r = await fetch(url, {method:'POST', headers:{'kbn-xsrf':'true','Content-Type':'application/json','x-elastic-internal-origin':'Kibana'},
           body: body!==undefined ? JSON.stringify(body) : undefined});
         var t = await r.text();
         if (r.status>=500 || r.status===429) throw new Error(r.status+' '+t.slice(0,200));
@@ -36,7 +35,7 @@
 
   /* ---------- discovery ---------- */
   async function whoami(){
-    var info = await es('GET','');
+    var info = await es('GET','/');
     var me = await es('GET','_security/_authenticate').catch(function(){ return {data:{}}; });
     return {
       cluster: (info.data&&info.data.cluster_name)||'(unknown)',
@@ -47,16 +46,24 @@
   }
   async function listIndices(includeSystem){
     var r = await es('GET','_resolve/index/*');
-    var names = ((r.data&&r.data.indices)||[]).map(function(x){ return x.name; });
-    if (!includeSystem) names = names.filter(function(n){ return n[0] !== '.'; });
-    return names.sort();
+    var idx = ((r.data&&r.data.indices)||[]).map(function(x){ return x.name; });
+    if (!includeSystem) idx = idx.filter(function(n){ return n[0] !== '.'; });
+    var ds = ((r.data&&r.data.data_streams)||[]).map(function(x){ return x.name; });
+    window.__klm_ds = {}; ds.forEach(function(n){ window.__klm_ds[n]=true; });
+    return idx.concat(ds).sort();
   }
   async function analyze(idx){
-    var out = {idx:idx, docs:0, dateFields:[], suggested:null, err:null};
+    var out = {idx:idx, docs:0, dateFields:[], suggested:null, err:null, isDS:!!(window.__klm_ds&&window.__klm_ds[idx])};
     try{
       var cnt = await es('GET', idx+'/_count');
       out.docs = (cnt.data&&cnt.data.count)||0;
-      var fc = await es('GET', idx+'/_field_caps?fields=*&types=date');
+      if (out.isDS){
+        var dd = await es('GET','_data_stream/'+idx);
+        var e = dd.data&&dd.data.data_streams&&dd.data.data_streams[0];
+        if (e){ out.suggested = e.timestamp_field&&e.timestamp_field.name; out.dsTemplate = e.template; out.dsIlm = e.ilm_policy||null;
+          out.dateFields = [{field:out.suggested, count:out.docs, min:null, max:null}]; }
+      }
+      else { var fc = await es('GET', idx+'/_field_caps?fields=*&types=date');
       var fields = Object.keys((fc.data&&fc.data.fields)||{});
       if (fields.length){
         var aggs={}; fields.forEach(function(f,n){ aggs['c'+n]={value_count:{field:f}}; aggs['mn'+n]={min:{field:f}}; aggs['mx'+n]={max:{field:f}}; });
@@ -68,7 +75,7 @@
         });
         var populated = out.dateFields.filter(function(d){ return d.count>0; });
         out.suggested = populated.length ? populated[0].field : null;
-      }
+      } }
     }catch(e){ out.err = String(e).slice(0,200); }
     return out;
   }
@@ -137,28 +144,45 @@
   async function pullMappings(indices){
     var maps={};
     for (var i=0;i<indices.length;i++){
+      if (window.__klm_ds&&window.__klm_ds[indices[i]]) continue;
       var r = await es('GET', indices[i]+'/_mapping');
       maps[indices[i]] = (r.data[indices[i]]&&r.data[indices[i]].mappings)||{};
     }
     return maps;
   }
-
-  /* ---------- loader script generation (fills the tested template) ---------- */
-  function buildLoaderScript(plans, mappings, counts){
-    var order = plans.map(function(p){ return p.idx; });
-    var maps = order.map(function(i){
-      return "read -r -d '' MAP_"+i+" <<'JSON' || true\n"+JSON.stringify(mappings[i])+"\nJSON";
-    }).join('\n');
-    var expected = order.map(function(i){ return '['+i+']='+counts[i]; }).join(' ');
-    var timefields = plans.map(function(p){ return '['+p.idx+']="'+(p.timeField||'-')+'"'; }).join(' ');
-    return LOADER_TEMPLATE
-      .replace('@@MAPS@@', maps)
-      .replace('@@EXPECTED@@', expected)
-      .replace('@@TIMEFIELDS@@', timefields)
-      .replace('@@INDICES@@', order.join(' '));
+  async function pullTemplates(dsNames){
+    var out={index_templates:{}, component_templates:{}, ilm:{}};
+    for (var i=0;i<dsNames.length;i++){
+      var dd = await es('GET','_data_stream/'+dsNames[i]);
+      var e = dd.data&&dd.data.data_streams&&dd.data.data_streams[0]; if(!e) continue;
+      var itR = await es('GET','_index_template/'+e.template);
+      var it = itR.data.index_templates&&itR.data.index_templates[0]&&itR.data.index_templates[0].index_template;
+      if (it){ out.index_templates[e.template]=it;
+        var comps=it.composed_of||[];
+        for (var c=0;c<comps.length;c++){ var cr=await es('GET','_component_template/'+comps[c]);
+          var ct=cr.data.component_templates&&cr.data.component_templates[0]&&cr.data.component_templates[0].component_template;
+          if(ct) out.component_templates[comps[c]]=ct; }
+      }
+      if (e.ilm_policy){ var ir=await es('GET','_ilm/policy/'+e.ilm_policy);
+        if (ir.data[e.ilm_policy]) out.ilm[e.ilm_policy]=ir.data[e.ilm_policy]; }
+    }
+    return out;
   }
 
-  /* ---------- panel UI ---------- */
+  /* ---------- bundle emitters (manifest + templates) ---------- */
+  function buildManifest(plans){
+    var lines=['# name\texpected_count\ttime_field\ttype\ttemplate'];
+    plans.forEach(function(p){
+      var a=p.analysis||{};
+      var type = a.isDS ? 'data_stream' : 'index';
+      var tf = p.timeField || '-';
+      var tpl = a.dsTemplate || '';
+      lines.push([p.idx, (a.docs||0), tf, type, tpl].join('\t'));
+    });
+    return lines.join('\n')+'\n';
+  }
+
+  /* ---------- panel UI ----------  /* ---------- panel UI ---------- */
   function initPanel(){
     var S = { indices:[], selected:{}, analyses:{}, plans:[], mappings:{}, counts:{}, busy:false };
     window.__klm = window.__klm || {};
@@ -197,7 +221,7 @@
       + "<button data-analyze>Analyze selected</button>"
       + "<button data-export class='primary'>Export</button>"
       + "<button data-maps>Save mappings</button>"
-      + "<button data-loader>Generate loader</button>"
+      + "<button data-loader>Save bundle (manifest+templates)</button>"
       + "</div><div class='log' data-log></div>";
     document.body.appendChild(el);
     window.__klm.panel = el;
@@ -264,7 +288,9 @@
       if(missing.length){ log('Analyze first (missing: '+missing.join(', ')+')','er'); return; }
       setBusy(true);
       S.plans=plansFrom(sel); S.mappings=await pullMappings(sel);
-      log('Exporting '+sel.length+' index(es). Allow multiple downloads if Chrome asks.');
+      var dsSel=sel.filter(function(n){ return window.__klm_ds&&window.__klm_ds[n]; });
+      S.templates = dsSel.length ? await pullTemplates(dsSel) : {index_templates:{},component_templates:{},ilm:{}};
+      log('Exporting '+sel.length+' target(s)'+(dsSel.length?(' ('+dsSel.length+' data stream(s))'):'')+'. Allow multiple downloads if Chrome asks.');
       for (var i=0;i<S.plans.length;i++){
         try{
           await exportIndex(S.plans[i],
@@ -273,8 +299,19 @@
             null);
         }catch(e){ log('  '+S.plans[i].idx+' FAILED: '+String(e).slice(0,160),'er'); }
       }
-      log('Export complete. '+sel.length+' index(es).','ok');
+      saveBundle(S.plans, S.mappings, S.templates);
+      log('Export complete. Bundle (manifest, mappings, templates) saved. Load with load_dataset.sh.','ok');
       setBusy(false);
+    }
+    function saveBundle(plans, mappings, templates){
+      var cl=(S.who?S.who.cluster:'cluster');
+      dl(new Blob([buildManifest(plans)],{type:'text/plain'}), 'manifest.txt');
+      if (Object.keys(mappings).length) dl(new Blob([JSON.stringify(mappings,null,1)],{type:'application/json'}), 'mappings.json');
+      if (templates){
+        Object.keys(templates.index_templates||{}).forEach(function(k){ dl(new Blob([JSON.stringify(templates.index_templates[k],null,1)],{type:'application/json'}),'templates__index_template_'+k+'.json'); });
+        Object.keys(templates.component_templates||{}).forEach(function(k){ dl(new Blob([JSON.stringify(templates.component_templates[k],null,1)],{type:'application/json'}),'templates__component_template_'+k+'.json'); });
+        Object.keys(templates.ilm||{}).forEach(function(k){ dl(new Blob([JSON.stringify(templates.ilm[k],null,1)],{type:'application/json'}),'templates__ilm_'+k+'.json'); });
+      }
     }
     async function doMaps(){
       var sel=chosenIndices(); if(!sel.length){ log('Select indices first.','er'); return; }
@@ -283,23 +320,24 @@
       dl(new Blob([JSON.stringify(m,null,2)],{type:'application/json'}), 'mappings_'+(S.who?S.who.cluster:'cluster')+'.json');
       log('Saved mappings JSON.','ok'); setBusy(false);
     }
-    async function doLoader(){
-      var sel=chosenIndices(); if(!sel.length){ log('Select indices first.','er'); return; }
+    async function doBundle(){
+      var sel=chosenIndices(); if(!sel.length){ log('Select targets first.','er'); return; }
       var missing=sel.filter(function(n){ return !S.analyses[n]; });
       if(missing.length){ log('Analyze first so counts+time fields are known.','er'); return; }
       setBusy(true);
-      var plans=plansFrom(sel), maps=Object.keys(S.mappings).length?S.mappings:await pullMappings(sel);
-      var counts={}; sel.forEach(function(n){ counts[n]=S.analyses[n].docs; });
-      var script=buildLoaderScript(plans, maps, counts);
-      dl(new Blob([script],{type:'text/x-sh'}), 'load_'+(S.who?S.who.cluster:'cluster')+'.sh');
-      log('Saved loader script (chmod +x, then run against the target).','ok'); setBusy(false);
+      var plans=plansFrom(sel);
+      var maps=Object.keys(S.mappings).length?S.mappings:await pullMappings(sel);
+      var dsSel=sel.filter(function(n){ return window.__klm_ds&&window.__klm_ds[n]; });
+      var templates=dsSel.length?await pullTemplates(dsSel):{index_templates:{},component_templates:{},ilm:{}};
+      saveBundle(plans, maps, templates);
+      log('Saved bundle: manifest.txt, mappings.json, templates. Run load_dataset.sh -d <dir>.','ok'); setBusy(false);
     }
     function setBusy(b){ S.busy=b; ['data-analyze','data-export','data-maps','data-loader'].forEach(function(k){ el.querySelector('['+k+']').disabled=b; }); }
 
     el.querySelector('[data-analyze]').onclick=doAnalyze;
     el.querySelector('[data-export]').onclick=doExport;
     el.querySelector('[data-maps]').onclick=doMaps;
-    el.querySelector('[data-loader]').onclick=doLoader;
+    el.querySelector('[data-loader]').onclick=doBundle;
 
     (async function(){
       try{
@@ -314,5 +352,5 @@
   }
 
   if (typeof window !== 'undefined') initPanel();
-  if (typeof module !== 'undefined' && module.exports) module.exports = { buildLoaderScript: buildLoaderScript };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { buildManifest: buildManifest };
 })();
