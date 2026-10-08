@@ -74,6 +74,46 @@ The loader creates each index with its source mapping, bulk-loads the files,
 restores replica/refresh settings, verifies every count, and creates data
 views with the right time field per index.
 
+## Data streams
+
+Both tools detect data streams automatically and handle them end to end:
+
+- **Export** captures the stream's docs *and* the definition needed to rebuild
+  it: the index template, its component templates, and the ILM policy (if any).
+  These land in a `templates/` folder (shell tool) or as `templates__*.json`
+  files (bookmarklet). The `manifest.txt` marks each target `index` or
+  `data_stream`.
+- **Load** (`load_dataset.sh`) reads the manifest. For a data stream it creates
+  the component templates, index template, and ILM policy, creates the stream,
+  then bulk-indexes with the `create` op that data streams require. For a plain
+  index it does the original create-mapping + elasticdump path (or a curl bulk
+  fallback if elasticdump isn't installed).
+
+Nothing extra to do — if a lab has data streams, the same export → load flow
+just works. Verified end to end against Elasticsearch 9.5.4 (plain index and
+data stream in one bundle).
+
+## Files
+
+- `kibana-lab-migrator.js` / `.bookmarklet.txt` — in-Kibana export tool.
+- `export_from_es.sh` — export straight from Elasticsearch (no Kibana needed).
+- `load_dataset.sh` — restore a bundle (indices + data streams) onto a target.
+
+## Load command
+
+```bash
+chmod +x load_dataset.sh
+./load_dataset.sh -u https://target:9200 -k <API_KEY> -d ./export_dir -i \
+  -K https://target-kibana:5601
+```
+
+## Kibana version note
+
+Works on Kibana 8.x and 9.x. On 9.x the console proxy requires the
+`x-elastic-internal-origin: Kibana` header (the tool sends it) and rejects an
+empty request path, so the tool queries `/` for cluster info. No server config
+change is needed — Dev Tools Console being enabled is enough.
+
 ## Notes and limits
 
 - Runs in the browser, so it's bound by tab memory. For very large indices,
